@@ -11,5 +11,5 @@ __pycache__/
 
 # Secrets - never commit these
 .env
-SECURITY_NOTES.md
+
 
