@@ -3,14 +3,33 @@
 A working Flask + SQLite CRUD API for recipes. It stores data perfectly —
 and it trusts everyone. There is no authentication and no authorization yet.
 That is the point: you will add both, lesson by lesson, in Units 2 and 3.
+
+
+for my .schema:
+
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  failed_logins INTEGER DEFAULT 0,
+  locked_until TEXT
+);
+
 """
 
 import sqlite3
 
 from flask import Flask, g, jsonify, request
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from datetime import datetime, timedelta
+from fastapi import FastAPI
+
 
 DATABASE = "recipes.db"
-
+ph = PasswordHasher()
+app = FastAPI()
 app = Flask(__name__)
 
 
@@ -21,6 +40,9 @@ def get_db():
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 @app.teardown_appcontext
 def close_db(exception):
@@ -37,6 +59,164 @@ def recipe_to_dict(row):
         "instructions": row["instructions"],
         "is_public": bool(row["is_public"]),
     }
+
+
+@app.post("/users")
+def register():
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    email = data.get("email")
+    password = data.get("password")
+
+    missing_fields = []
+
+    if not username:
+        missing_fields.append("username")
+
+    if not email:
+        missing_fields.append("email")
+
+    if not password:
+        missing_fields.append("password")
+
+    if missing_fields:
+        return jsonify({
+            "error": "Missing required fields",
+            "fields": missing_fields
+        }), 400
+
+    db = get_db()
+    try:
+        hashed_password = ph.hash(password)
+
+        db.execute(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            (username, email, hashed_password),
+        )
+    
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "username or email already in use"}), 409
+
+    return (
+        jsonify(
+            {
+                "username": username,
+                "email": email,
+            }
+        ),
+        201,
+    )
+
+
+@app.post("/login")
+def login():
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    password = data.get("password")
+
+    missing_fields = []
+
+    if not username:
+        missing_fields.append("username")
+
+    if not password:
+        missing_fields.append("password")
+
+    if missing_fields:
+        return jsonify({
+            "error": "Missing required fields",
+            "fields": missing_fields
+        }), 400
+
+    row = get_db().execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username,)
+    ).fetchone()
+
+    if row is None:
+        return jsonify({"error": "bad credentials"}), 401
+
+    if row["locked_until"]:
+        locked_until = datetime.fromisoformat(row["locked_until"])
+
+        if datetime.utcnow() < locked_until:
+            return jsonify({
+                "error": "account locked, try again later",
+                "message": "Too many failed login attempts. Try again later."
+            }), 423
+
+
+        get_db().execute(
+            """
+            UPDATE users
+            SET failed_logins = 0,
+                locked_until = NULL
+            WHERE id = ?
+            """,
+            (row["id"],)
+        )
+        get_db().commit()
+
+    try:
+        ph.verify(row["password_hash"], password)
+        get_db().execute(
+            """
+            UPDATE users
+            SET failed_logins = 0,
+                locked_until = NULL
+            WHERE id = ?
+            """,
+            (row["id"],)
+        )
+        get_db().commit()
+
+    except VerifyMismatchError:
+        failed = row["failed_logins"] + 1
+
+        if failed >= 3:
+            lock_until = datetime.utcnow() + timedelta(minutes=5)
+
+            get_db().execute(
+                """
+                UPDATE users
+                SET failed_logins = ?,
+                    locked_until = ?
+                WHERE id = ?
+                """,
+                (failed, lock_until.isoformat(), row["id"])
+            )
+
+            get_db().commit()
+
+            return jsonify({
+                "error": "account locked",
+                "message": "Too many failed login attempts.",
+                "try_again_after": lock_until.isoformat()
+            }), 423
+
+        get_db().execute(
+            """
+            UPDATE users
+            SET failed_logins = ?
+            WHERE id = ?
+            """,
+            (failed, row["id"])
+        )
+
+        get_db().commit()
+
+        return jsonify({
+            "error": "bad credentials",
+            "message": "Username or password is incorrect."
+        }), 401
+
+    return jsonify({
+        "id": row["id"],
+        "username": row["username"]
+    }), 200
 
 
 @app.get("/")
