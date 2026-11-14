@@ -24,12 +24,16 @@ from flask import Flask, g, jsonify, request
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from datetime import datetime, timedelta
-from fastapi import FastAPI
 
+import os, jwt
+from dotenv import load_dotenv
+
+load_dotenv()
+JWT_SECRET = os.getenv("JWT_SECRET")
+print("DEBUG JWT_SECRET =", JWT_SECRET)
 
 DATABASE = "recipes.db"
 ph = PasswordHasher()
-app = FastAPI()
 app = Flask(__name__)
 
 
@@ -172,6 +176,18 @@ def login():
             (row["id"],)
         )
         get_db().commit()
+        user_id = row["id"]
+
+        payload = {
+            "sub": str(user_id),
+            "exp": datetime.utcnow() + timedelta(hours=1),
+        }
+
+        token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+        return jsonify({"token": token}), 200
+       
+        
 
     except VerifyMismatchError:
         failed = row["failed_logins"] + 1
@@ -242,6 +258,24 @@ def get_recipe(recipe_id):
 
 @app.post("/recipes")
 def create_recipe():
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"]
+        )
+    except Exception:
+        return jsonify({"error": "Invalid token"}), 401
+
+    user_id = payload["sub"]
+
     data = request.get_json(silent=True)
     if not data or not data.get("title") or not data.get("ingredients"):
         return jsonify({"error": "title and ingredients are required"}), 400
@@ -268,45 +302,97 @@ def create_recipe():
 
 @app.patch("/recipes/<int:recipe_id>")
 def update_recipe(recipe_id):
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"]
+        )
+    except jwt.PyJWTError:
+        return jsonify({"error": "Invalid token"}), 401
+
+    user_id = payload["sub"]
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"error": "a JSON body is required"}), 400
+
     fields, values = [], []
+
     for column in ("title", "ingredients", "instructions"):
         if column in data:
             fields.append(f"{column} = ?")
             values.append(data[column])
+
     if "is_public" in data:
         fields.append("is_public = ?")
         values.append(1 if data["is_public"] else 0)
+
     if not fields:
         return jsonify({"error": "nothing to update"}), 400
+
     values.append(recipe_id)
+
     db = get_db()
+
     try:
         cur = db.execute(
-            f"UPDATE recipes SET {', '.join(fields)} WHERE id = ?", values
+            f"UPDATE recipes SET {', '.join(fields)} WHERE id = ?",
+            values
         )
         db.commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "a recipe with that title already exists"}), 409
+
     if cur.rowcount == 0:
         return jsonify({"error": "recipe not found"}), 404
-    row = db.execute(
-        "SELECT * FROM recipes WHERE id = ?", (recipe_id,)
-    ).fetchone()
-    return jsonify(recipe_to_dict(row))
 
+    row = db.execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+
+    return jsonify(recipe_to_dict(row))
 
 @app.delete("/recipes/<int:recipe_id>")
 def delete_recipe(recipe_id):
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"]
+        )
+    except jwt.PyJWTError:
+        return jsonify({"error": "Invalid token"}), 401
+
+    user_id = payload["sub"]
+
     db = get_db()
-    cur = db.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+
+    cur = db.execute(
+        "DELETE FROM recipes WHERE id = ?",
+        (recipe_id,)
+    )
     db.commit()
+
     if cur.rowcount == 0:
         return jsonify({"error": "recipe not found"}), 404
-    return "", 204
 
+    return "", 204
 
 if __name__ == "__main__":
     app.run(debug=True)
