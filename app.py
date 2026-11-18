@@ -16,6 +16,14 @@ CREATE TABLE users (
   locked_until TEXT
 );
 
+CREATE TABLE recipes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    ingredients TEXT NOT NULL,
+    instructions TEXT,
+    user_id INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
 """
 
 import sqlite3
@@ -185,10 +193,12 @@ def login():
 
         token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-        return jsonify({"token": token}), 200
+        return jsonify({
+    "token": token,
+    "id": row["id"],
+    "username": row["username"]
+}), 200
        
-        
-
     except VerifyMismatchError:
         failed = row["failed_logins"] + 1
 
@@ -229,12 +239,6 @@ def login():
             "message": "Username or password is incorrect."
         }), 401
 
-    return jsonify({
-        "id": row["id"],
-        "username": row["username"]
-    }), 200
-
-
 @app.get("/")
 def hello():
     return jsonify({"message": "Recipe Box API", "recipes": "/recipes"})
@@ -242,18 +246,121 @@ def hello():
 
 @app.get("/recipes")
 def list_recipes():
-    rows = get_db().execute("SELECT * FROM recipes ORDER BY id").fetchall()
-    return jsonify([recipe_to_dict(r) for r in rows])
+
+    auth_header = request.headers.get("Authorization")
+
+    user_id = None
+
+    if auth_header and auth_header.startswith("Bearer "):
+
+        token = auth_header.split(" ", 1)[1]
+
+        try:
+            payload = jwt.decode(
+                token,
+                JWT_SECRET,
+                algorithms=["HS256"]
+            )
+
+            user_id = int(payload["sub"])
+
+        except jwt.PyJWTError:
+            user_id = None
+
+    db = get_db()
+
+    if user_id is None:
+
+        rows = db.execute(
+            """
+            SELECT *
+            FROM recipes
+            WHERE is_public = 1
+            ORDER BY title
+            """
+        ).fetchall()
+
+    else:
+
+        rows = db.execute(
+            """
+            SELECT *
+            FROM recipes
+            WHERE is_public = 1
+               OR user_id = ?
+            ORDER BY title
+            """,
+            (user_id,)
+        ).fetchall()
+
+    return jsonify(
+        [recipe_to_dict(row) for row in rows]
+    )
 
 
 @app.get("/recipes/<int:recipe_id>")
 def get_recipe(recipe_id):
-    row = get_db().execute(
-        "SELECT * FROM recipes WHERE id = ?", (recipe_id,)
+
+    recipe = get_db().execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
     ).fetchone()
-    if row is None:
-        return jsonify({"error": "recipe not found"}), 404
-    return jsonify(recipe_to_dict(row))
+
+    if recipe is None:
+        return jsonify({
+            "error": "recipe not found"
+        }), 404
+
+    # Public recipes can be viewed by anyone
+    if recipe["is_public"]:
+        return jsonify(
+            recipe_to_dict(recipe)
+        ), 200
+
+    # Private recipe below
+
+    auth_header = request.headers.get(
+        "Authorization"
+    )
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({
+            "error": "authentication required",
+            "message": "Please log in to view this private recipe."
+        }), 401
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"]
+        )
+
+        user_id = int(payload["sub"])
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({
+            "error": "token expired",
+            "message": "Your session has expired. Please log in again."
+        }), 401
+
+    except jwt.PyJWTError:
+        return jsonify({
+            "error": "invalid token",
+            "message": "Please log in again."
+        }), 401
+
+    if recipe["user_id"] != user_id:
+        return jsonify({
+            "error": "forbidden",
+            "message": "This recipe is private and belongs to another user."
+        }), 403
+
+    return jsonify(
+        recipe_to_dict(recipe)
+    ), 200
 
 
 @app.post("/recipes")
@@ -271,32 +378,55 @@ def create_recipe():
             JWT_SECRET,
             algorithms=["HS256"]
         )
-    except Exception:
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except jwt.PyJWTError:
         return jsonify({"error": "Invalid token"}), 401
 
-    user_id = payload["sub"]
+    user_id = int(payload["sub"])
 
     data = request.get_json(silent=True)
+
     if not data or not data.get("title") or not data.get("ingredients"):
-        return jsonify({"error": "title and ingredients are required"}), 400
+        return jsonify(
+            {"error": "title and ingredients are required"}
+        ), 400
+
     db = get_db()
+
     try:
         cur = db.execute(
-            "INSERT INTO recipes (title, ingredients, instructions, is_public)"
-            " VALUES (?, ?, ?, ?)",
+            """
+            INSERT INTO recipes (
+                title,
+                ingredients,
+                instructions,
+                is_public,
+                user_id
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
             (
                 data["title"],
                 data["ingredients"],
                 data.get("instructions", ""),
                 1 if data.get("is_public", True) else 0,
+                user_id,
             ),
         )
+
         db.commit()
+
     except sqlite3.IntegrityError:
-        return jsonify({"error": "a recipe with that title already exists"}), 409
+        return jsonify(
+            {"error": "a recipe with that title already exists"}
+        ), 409
+
     row = db.execute(
-        "SELECT * FROM recipes WHERE id = ?", (cur.lastrowid,)
+        "SELECT * FROM recipes WHERE id = ?",
+        (cur.lastrowid,)
     ).fetchone()
+
     return jsonify(recipe_to_dict(row)), 201
 
 
@@ -315,10 +445,28 @@ def update_recipe(recipe_id):
             JWT_SECRET,
             algorithms=["HS256"]
         )
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
     except jwt.PyJWTError:
         return jsonify({"error": "Invalid token"}), 401
 
     user_id = payload["sub"]
+
+    db = get_db()
+
+    recipe = db.execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+
+    if recipe is None:
+        return jsonify({"error": "recipe not found"}), 404
+
+    if recipe["user_id"] != int(user_id):
+        return jsonify({
+            "error": "forbidden",
+            "message": "You can only modify your own recipes."
+        }), 403
 
     data = request.get_json(silent=True)
     if not data:
@@ -339,8 +487,6 @@ def update_recipe(recipe_id):
         return jsonify({"error": "nothing to update"}), 400
 
     values.append(recipe_id)
-
-    db = get_db()
 
     try:
         cur = db.execute(
@@ -376,23 +522,39 @@ def delete_recipe(recipe_id):
             JWT_SECRET,
             algorithms=["HS256"]
         )
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
     except jwt.PyJWTError:
         return jsonify({"error": "Invalid token"}), 401
 
-    user_id = payload["sub"]
+    user_id = int(payload["sub"])
 
     db = get_db()
 
-    cur = db.execute(
+    recipe = db.execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+
+    if recipe is None:
+        return jsonify({"error": "recipe not found"}), 404
+
+    if recipe["user_id"] != user_id:
+        return jsonify({
+            "error": "forbidden",
+            "message": "You can only delete your own recipes."
+        }), 403
+
+    db.execute(
         "DELETE FROM recipes WHERE id = ?",
         (recipe_id,)
     )
+
     db.commit()
 
-    if cur.rowcount == 0:
-        return jsonify({"error": "recipe not found"}), 404
-
-    return "", 204
+    return jsonify({
+        "message": "recipe deleted"
+    }), 200
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
