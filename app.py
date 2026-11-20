@@ -44,7 +44,6 @@ DATABASE = "recipes.db"
 ph = PasswordHasher()
 app = Flask(__name__)
 
-
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
@@ -188,16 +187,21 @@ def login():
 
         payload = {
             "sub": str(user_id),
+            "role": row["role"],
             "exp": datetime.utcnow() + timedelta(hours=1),
         }
 
-        token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+        token = jwt.encode(payload, 
+            JWT_SECRET, 
+            algorithm="HS256"
+        )
 
         return jsonify({
-    "token": token,
-    "id": row["id"],
-    "username": row["username"]
-}), 200
+            "token": token,
+            "id": row["id"],
+            "username": row["username"],
+            "role": row["role"]
+        }), 200
        
     except VerifyMismatchError:
         failed = row["failed_logins"] + 1
@@ -229,7 +233,10 @@ def login():
             SET failed_logins = ?
             WHERE id = ?
             """,
-            (failed, row["id"])
+            (
+                failed, 
+                row["id"]
+            )
         )
 
         get_db().commit()
@@ -263,6 +270,7 @@ def list_recipes():
             )
 
             user_id = int(payload["sub"])
+            role = payload["role"]
 
         except jwt.PyJWTError:
             user_id = None
@@ -339,6 +347,7 @@ def get_recipe(recipe_id):
         )
 
         user_id = int(payload["sub"])
+        role = payload["role"]
 
     except jwt.ExpiredSignatureError:
         return jsonify({
@@ -352,7 +361,7 @@ def get_recipe(recipe_id):
             "message": "Please log in again."
         }), 401
 
-    if recipe["user_id"] != user_id:
+    if recipe["user_id"] != user_id and role != "admin":
         return jsonify({
             "error": "forbidden",
             "message": "This recipe is private and belongs to another user."
@@ -384,6 +393,7 @@ def create_recipe():
         return jsonify({"error": "Invalid token"}), 401
 
     user_id = int(payload["sub"])
+    role = payload["role"]
 
     data = request.get_json(silent=True)
 
@@ -451,6 +461,7 @@ def update_recipe(recipe_id):
         return jsonify({"error": "Invalid token"}), 401
 
     user_id = payload["sub"]
+    role = payload["role"]
 
     db = get_db()
 
@@ -462,10 +473,10 @@ def update_recipe(recipe_id):
     if recipe is None:
         return jsonify({"error": "recipe not found"}), 404
 
-    if recipe["user_id"] != int(user_id):
+    if recipe["user_id"] != int(user_id) and role != "admin":
         return jsonify({
             "error": "forbidden",
-            "message": "You can only modify your own recipes."
+            "message": "You can only modify your own recipes unless you are an administrator."
         }), 403
 
     data = request.get_json(silent=True)
@@ -528,6 +539,7 @@ def delete_recipe(recipe_id):
         return jsonify({"error": "Invalid token"}), 401
 
     user_id = int(payload["sub"])
+    role = payload["role"]
 
     db = get_db()
 
@@ -539,10 +551,10 @@ def delete_recipe(recipe_id):
     if recipe is None:
         return jsonify({"error": "recipe not found"}), 404
 
-    if recipe["user_id"] != user_id:
+    if recipe["user_id"] != user_id and role != "admin":
         return jsonify({
             "error": "forbidden",
-            "message": "You can only delete your own recipes."
+            "message": "You can only delete your own recipes unless you are an administrator."
         }), 403
 
     db.execute(
@@ -557,4 +569,4 @@ def delete_recipe(recipe_id):
     }), 200
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)
