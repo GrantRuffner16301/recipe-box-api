@@ -8,24 +8,25 @@ That is the point: you will add both, lesson by lesson, in Units 2 and 3.
 for my .schema:
 
 CREATE TABLE users (
-  id INTEGER PRIMARY KEY,
-  username TEXT NOT NULL UNIQUE,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  failed_logins INTEGER DEFAULT 0,
-  locked_until TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    failed_logins INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT
 );
 
 CREATE TABLE recipes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
+    title TEXT NOT NULL UNIQUE,
     ingredients TEXT NOT NULL,
     instructions TEXT,
+    is_public INTEGER NOT NULL DEFAULT 1,
     user_id INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 """
-
 import sqlite3
 
 from flask import Flask, g, jsonify, request
@@ -70,6 +71,41 @@ def recipe_to_dict(row):
         "instructions": row["instructions"],
         "is_public": bool(row["is_public"]),
     }
+
+@app.before_request
+def load_current_user():
+    path = request.path
+    method = request.method
+
+    if (
+        (path == "/login" and method == "POST")
+        or (path == "/users" and method == "POST")
+        or (path.startswith("/recipes") and method == "GET")
+        or (path.startswith("/register") and method == "POST")
+        ):
+
+        return  
+
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+
+    token = auth_header.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+           algorithms=["HS256"]
+        )
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except jwt.PyJWTError:
+        return jsonify({"error": "Invalid token"}), 401
+
+    g.user_id = int(payload["sub"])
+    g.role = payload["role"]
 
 
 @app.post("/users")
@@ -442,48 +478,32 @@ def create_recipe():
 
 @app.patch("/recipes/<int:recipe_id>")
 def update_recipe(recipe_id):
-    auth_header = request.headers.get("Authorization")
-
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Missing or invalid token"}), 401
-
-    token = auth_header.split(" ", 1)[1]
-
-    try:
-        payload = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=["HS256"]
-        )
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "Token expired"}), 401
-    except jwt.PyJWTError:
-        return jsonify({"error": "Invalid token"}), 401
-
-    user_id = payload["sub"]
-    role = payload["role"]
 
     db = get_db()
 
-    recipe = db.execute(
-        "SELECT * FROM recipes WHERE id = ?",
-        (recipe_id,)
-    ).fetchone()
+    recipe = db.execute("SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)).fetchone()
 
     if recipe is None:
         return jsonify({"error": "recipe not found"}), 404
 
-    if recipe["user_id"] != int(user_id) and role != "admin":
-        return jsonify({
-            "error": "forbidden",
-            "message": "You can only modify your own recipes unless you are an administrator."
+    if (
+        recipe["user_id"] != g.user_id 
+        and g.role != "admin"
+    ):
+        return jsonify({"error": "forbidden",
+            "message": (
+                "You can only modify your own recipes unless you are an administrator."
+            )
         }), 403
 
     data = request.get_json(silent=True)
+
     if not data:
         return jsonify({"error": "a JSON body is required"}), 400
 
-    fields, values = [], []
+    fields = []
+    values = []
 
     for column in ("title", "ingredients", "instructions"):
         if column in data:
@@ -500,47 +520,29 @@ def update_recipe(recipe_id):
     values.append(recipe_id)
 
     try:
-        cur = db.execute(
-            f"UPDATE recipes SET {', '.join(fields)} WHERE id = ?",
-            values
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        return jsonify({"error": "a recipe with that title already exists"}), 409
 
-    if cur.rowcount == 0:
-        return jsonify({"error": "recipe not found"}), 404
+        cur = db.execute(f"""UPDATE recipes 
+            SET {', '.join(fields)}
+            WHERE id = ?""", values)
+
+        db.commit()
+
+    except sqlite3.IntegrityError:
+
+        return jsonify({"error": "a recipe with that title already exists"}), 409
 
     row = db.execute(
         "SELECT * FROM recipes WHERE id = ?",
         (recipe_id,)
     ).fetchone()
 
-    return jsonify(recipe_to_dict(row))
+    return jsonify(
+        recipe_to_dict(row)
+    )
 
 @app.delete("/recipes/<int:recipe_id>")
 def delete_recipe(recipe_id):
-    auth_header = request.headers.get("Authorization")
-
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Missing or invalid token"}), 401
-
-    token = auth_header.split(" ", 1)[1]
-
-    try:
-        payload = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=["HS256"]
-        )
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "Token expired"}), 401
-    except jwt.PyJWTError:
-        return jsonify({"error": "Invalid token"}), 401
-
-    user_id = int(payload["sub"])
-    role = payload["role"]
-
+    
     db = get_db()
 
     recipe = db.execute(
@@ -551,10 +553,15 @@ def delete_recipe(recipe_id):
     if recipe is None:
         return jsonify({"error": "recipe not found"}), 404
 
-    if recipe["user_id"] != user_id and role != "admin":
+    if (
+        recipe["user_id"] != g.user_id 
+        and g.role != "admin"
+    ):
         return jsonify({
             "error": "forbidden",
-            "message": "You can only delete your own recipes unless you are an administrator."
+            "message": (
+                "You can only delete your own recipes unless you are an administrator."
+            )
         }), 403
 
     db.execute(
